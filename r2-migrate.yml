@@ -1,0 +1,77 @@
+name: R2 Migrate (rclone)
+on:
+  schedule:
+    - cron: "*/15 * * * *"     # 每15分钟跑一次（UTC）
+  workflow_dispatch: {}        # 手动触发
+  push:
+    paths:
+      - r2_migrate.sh          # 只有脚本改动时触发
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360       # 视数据量调整
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install rclone
+        run: |
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+
+      - name: Prepare env and config
+        env:
+          # 源 R2
+          R2PUSH_ACCESS_KEY:  ${{ secrets.R2PUSH_ACCESS_KEY }}
+          R2PUSH_SECRET_KEY:  ${{ secrets.R2PUSH_SECRET_KEY }}
+          R2PUSH_ENDPOINT:    ${{ secrets.R2PUSH_ENDPOINT }}
+          # 目的 R2
+          R2DST_ACCESS_KEY:   ${{ secrets.R2DST_ACCESS_KEY }}
+          R2DST_SECRET_KEY:   ${{ secrets.R2DST_SECRET_KEY }}
+          R2DST_ENDPOINT:     ${{ secrets.R2DST_ENDPOINT }}
+        run: |
+          # 配置 rclone remotes（使用命名 remote：r2push / r2dst）
+          rclone config create r2push s3 \
+            provider=Other env_auth=false access_key_id="${R2PUSH_ACCESS_KEY}" secret_access_key="${R2PUSH_SECRET_KEY}" \
+            region=auto endpoint="${R2PUSH_ENDPOINT}" \
+            s3-chunk-size=32M s3-upload-concurrency=2
+
+          rclone config create r2dst s3 \
+            provider=Other env_auth=false access_key_id="${R2DST_ACCESS_KEY}" secret_access_key="${R2DST_SECRET_KEY}" \
+            region=auto endpoint="${R2DST_ENDPOINT}" \
+            s3-chunk-size=32M s3-upload-concurrency=2
+
+          rclone config show
+
+      - name: Run migrate script (foreground)
+        env:
+          # 你的脚本用到的环境变量（可按需覆盖）
+          SRC_REMOTE: r2push
+          DST_REMOTE: r2dst
+          SRC_BUCKET: yasyadong001
+          DST_BUCKET: yas003
+          SYNC_INTERVAL: "120"
+          MIN_AGE: "60s"
+          TRANSFERS: "2"
+          CHECKERS: "4"
+          UPLOAD_CONC: "2"
+          BW_LIMIT: "10M"
+          TPS_LIMIT: "8"
+          CHUNK_SIZE: "32M"
+          COPY_CUTOFF: "256M"
+          MAX_RETRIES: "8"
+          VERIFY_EVERY_N_ROUNDS: "10"
+          RUN_DIR: "./run"
+          LOG_DIR: "./logs"
+        run: |
+          chmod +x ./r2_migrate.sh
+          # 在 CI 中我们一般“跑一轮”即可，不守护。可以直接调一次 sync_then_exit 的思路：
+          # 复用你的前台模式 + 控制循环次数：这里用 sed 包装一次（或者临时覆盖 SYNC_INTERVAL 跑一次）
+          # 简单做法：直接执行一轮 copy（复制你 sync_once 的核心），可直接调用脚本的 foreground 再用 timeout 限制。
+          timeout 50m ./r2_migrate.sh foreground || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: r2-migrate-logs
+          path: logs/
