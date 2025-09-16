@@ -1,0 +1,161 @@
+name: R2 Migrate (sharded, rclone)
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Shard mode: prefix 或 glob"
+        required: true
+        default: "glob"
+        type: choice
+        options: [glob, prefix]
+  # 如需定时，取消注释（UTC）
+  # schedule:
+  #   - cron: "0 * * * *"   # 每整点
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        # ---- 方式 A：按 GLOB 切分（默认更通用，推荐）----
+        # 每个条目只搬运匹配该 GLOB 的对象；可增减并发颗粒度
+        # 例如 keys 各种目录/前缀混杂时，用 GLOB 更安全
+        glob:
+          - "0/**"  - "1/**"  - "2/**"  - "3/**"
+          - "4/**"  - "5/**"  - "6/**"  - "7/**"
+          - "8/**"  - "9/**"  - "a/**"  - "b/**"
+          - "c/**"  - "d/**"  - "e/**"  - "f/**"
+        # ---- 方式 B：按 S3 prefix 切分（仅当你的 key 真是这样组织时才用）----
+        # 若选择 mode=prefix，则使用下面列表作为真正的 S3 Prefix
+        prefix:
+          - "0" - "1" - "2" - "3" - "4" - "5" - "6" - "7"
+          - "8" - "9" - "a" - "b" - "c" - "d" - "e" - "f"
+
+    env:
+      # 桶名
+      SRC_BUCKET: yasyadong001
+      DST_BUCKET: yas004
+
+      # 速率/并发/稳定性（保守默认，先稳再加）
+      MIN_AGE: "60s"              # 只搬 ≥60s 的稳定文件
+      TRANSFERS: "4"              # 适度提高小文件吞吐
+      CHECKERS: "8"
+      UPLOAD_CONC: "4"
+      BW_LIMIT: "0"               # 不限带宽（如需限速设 10M 等）
+      TPS_LIMIT: "12"             # 如遇 429 降低
+      CHUNK_SIZE: "32M"
+      COPY_CUTOFF: "256M"
+      MAX_RETRIES: "8"
+      LOW_LEVEL_RETRIES: "20"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install rclone
+        run: |
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+          rclone version
+
+      - name: Configure rclone remotes (R2 → R2)
+        env:
+          # 源 R2（push）
+          R2PUSH_ACCESS_KEY:  ${{ secrets.R2PUSH_ACCESS_KEY }}
+          R2PUSH_SECRET_KEY:  ${{ secrets.R2PUSH_SECRET_KEY }}
+          R2PUSH_ENDPOINT:    ${{ secrets.R2PUSH_ENDPOINT }}
+          # 目的 R2（dst）
+          R2DST_ACCESS_KEY:   ${{ secrets.R2DST_ACCESS_KEY }}
+          R2DST_SECRET_KEY:   ${{ secrets.R2DST_SECRET_KEY }}
+          R2DST_ENDPOINT:     ${{ secrets.R2DST_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          rclone config create r2push s3 \
+            provider=Other env_auth=false \
+            access_key_id="${R2PUSH_ACCESS_KEY}" secret_access_key="${R2PUSH_SECRET_KEY}" \
+            region=auto endpoint="${R2PUSH_ENDPOINT}" \
+            s3-chunk-size="${CHUNK_SIZE}" s3-upload-concurrency="${UPLOAD_CONC}"
+
+          rclone config create r2dst s3 \
+            provider=Other env_auth=false \
+            access_key_id="${R2DST_ACCESS_KEY}" secret_access_key="${R2DST_SECRET_KEY}" \
+            region=auto endpoint="${R2DST_ENDPOINT}" \
+            s3-chunk-size="${CHUNK_SIZE}" s3-upload-concurrency="${UPLOAD_CONC}"
+
+          rclone listremotes
+
+      - name: One-shot copy (shard)
+        env:
+          MODE: ${{ github.event.inputs.mode || 'glob' }}
+          THIS_GLOB:   ${{ matrix.glob }}
+          THIS_PREFIX: ${{ matrix.prefix }}
+        run: |
+          set -euo pipefail
+          mkdir -p logs
+          LOG_FILE="logs/r2_copy_${MODE}_$(date -u +%F_%H-%M-%S)_${{ matrix.glob || matrix.prefix }}.log"
+
+          echo "[$(date -u '+%F %T')] MODE=${MODE}" | tee -a "$LOG_FILE"
+
+          if [[ "${MODE}" == "prefix" ]]; then
+            # 方式 B：S3 原生 prefix（仅当 key 真的是以该字符开头组织）
+            SRC_PATH="r2push:${SRC_BUCKET}/${THIS_PREFIX}"
+            DST_PATH="r2dst:${DST_BUCKET}/${THIS_PREFIX}"
+
+            echo "[$(date -u '+%F %T')] Copy with S3 prefix: ${THIS_PREFIX}" | tee -a "$LOG_FILE"
+            rclone copy "${SRC_PATH}" "${DST_PATH}" \
+              --fast-list --metadata --size-only \
+              --min-age "${MIN_AGE}" \
+              --transfers "${TRANSFERS}" --checkers "${CHECKERS}" \
+              --bwlimit "${BW_LIMIT}" --tpslimit "${TPS_LIMIT}" \
+              --s3-chunk-size "${CHUNK_SIZE}" --s3-copy-cutoff "${COPY_CUTOFF}" \
+              --retries "${MAX_RETRIES}" --low-level-retries "${LOW_LEVEL_RETRIES}" \
+              --progress 2>&1 | tee -a "$LOG_FILE"
+
+          else
+            # 方式 A：GLOB 过滤（推荐，目录/命名杂时也适用）
+            # 思路：目标路径仍是桶根，但用 include 只搬本 shard
+            SRC_PATH="r2push:${SRC_BUCKET}"
+            DST_PATH="r2dst:${DST_BUCKET}"
+
+            echo "[$(date -u '+%F %T')] Copy with include glob: ${THIS_GLOB}" | tee -a "$LOG_FILE"
+            rclone copy "${SRC_PATH}" "${DST_PATH}" \
+              --fast-list --metadata --size-only \
+              --min-age "${MIN_AGE}" \
+              --include "${THIS_GLOB}" --exclude="**" \
+              --transfers "${TRANSFERS}" --checkers "${CHECKERS}" \
+              --bwlimit "${BW_LIMIT}" --tpslimit "${TPS_LIMIT}" \
+              --s3-chunk-size "${CHUNK_SIZE}" --s3-copy-cutoff "${COPY_CUTOFF}" \
+              --retries "${MAX_RETRIES}" --low-level-retries "${LOW_LEVEL_RETRIES}" \
+              --progress 2>&1 | tee -a "$LOG_FILE"
+          fi
+
+          echo "[$(date -u '+%F %T')] Shard done." | tee -a "$LOG_FILE"
+
+      - name: Optional one-way verify (size-only)
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p logs
+          LOG_FILE="logs/r2_check_$(date -u +%F_%H-%M-%S)_${{ matrix.glob || matrix.prefix }}.log"
+          echo "[$(date -u '+%F %T')] Start check (one-way, size-only)" | tee -a "$LOG_FILE"
+          # 用相同的过滤器做 shard 校验
+          if [[ "${{ github.event.inputs.mode || 'glob' }}" == "prefix" ]]; then
+            rclone check "r2push:${SRC_BUCKET}/${{ matrix.prefix }}" "r2dst:${DST_BUCKET}/${{ matrix.prefix }}" \
+              --one-way --size-only --checkers $((CHECKERS*2)) --progress 2>&1 | tee -a "$LOG_FILE" || true
+          else
+            rclone check "r2push:${SRC_BUCKET}" "r2dst:${DST_BUCKET}" \
+              --one-way --size-only --checkers $((CHECKERS*2)) \
+              --include "${{ matrix.glob }}" --exclude="**" \
+              --progress 2>&1 | tee -a "$LOG_FILE" || true
+          fi
+          echo "[$(date -u '+%F %T')] Check done." | tee -a "$LOG_FILE"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: r2-migrate-logs-${{ matrix.glob || matrix.prefix }}
+          path: logs/
+          retention-days: 7
