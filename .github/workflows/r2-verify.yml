@@ -1,21 +1,18 @@
 name: R2 Final Verify (glob-sharded, checksum)
 
 on:
-  workflow_dispatch: {}          # 手动触发
-  # 如需定时收尾复核，取消注释（UTC）
+  workflow_dispatch: {}
   # schedule:
-  #   - cron: "30 3 * * *"       # 每天 03:30 运行
+  #   - cron: "30 3 * * *"   # 可选：每日 03:30 收尾校验（UTC）
 
 env:
-  # 桶名（按需改）
   SRC_BUCKET: yasyadong001
   DST_BUCKET: yas003
 
-  # 并发/稳定性（略保守，确保校验稳定）
   TRANSFERS: "4"
   CHECKERS: "16"
   UPLOAD_CONC: "4"
-  BW_LIMIT: "0"                  # 不限带宽；如需限速设 "10M"
+  BW_LIMIT: "0"
   TPS_LIMIT: "12"
   CHUNK_SIZE: "32M"
   COPY_CUTOFF: "256M"
@@ -58,11 +55,9 @@ jobs:
 
       - name: Configure rclone remotes (Cloudflare R2 → R2)
         env:
-          # 源 R2（push）
           R2PUSH_ACCESS_KEY:  ${{ secrets.R2PUSH_ACCESS_KEY }}
           R2PUSH_SECRET_KEY:  ${{ secrets.R2PUSH_SECRET_KEY }}
           R2PUSH_ENDPOINT:    ${{ secrets.R2PUSH_ENDPOINT }}
-          # 目的 R2（dst）
           R2DST_ACCESS_KEY:   ${{ secrets.R2DST_ACCESS_KEY }}
           R2DST_SECRET_KEY:   ${{ secrets.R2DST_SECRET_KEY }}
           R2DST_ENDPOINT:     ${{ secrets.R2DST_ENDPOINT }}
@@ -86,12 +81,11 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p logs
-          SAFE_TAG="${{ matrix.shard//\//_ }}"
+          SAFE_TAG="$(printf '%s' '${{ matrix.shard }}' | tr '/' '_')"
           LOG_FILE="logs/r2_repair_${SAFE_TAG}_$(date -u +%F_%H-%M-%S).log"
 
           echo "[$(date -u '+%F %T')] Repair copy with checksum, include: ${{ matrix.shard }}" | tee -a "$LOG_FILE"
 
-          # 使用 --checksum 强制以内容校验，不依赖时间戳；不删除目标多余对象
           rclone copy "r2push:${SRC_BUCKET}" "r2dst:${DST_BUCKET}" \
             --fast-list --metadata --checksum \
             --include "${{ matrix.shard }}" --exclude="**" \
@@ -105,12 +99,11 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p logs
-          SAFE_TAG="${{ matrix.shard//\//_ }}"
+          SAFE_TAG="$(printf '%s' '${{ matrix.shard }}' | tr '/' '_')"
           LOG_FILE="logs/r2_verify_${SAFE_TAG}_$(date -u +%F_%H-%M-%S).log"
 
           echo "[$(date -u '+%F %T')] Final verify with checksum, include: ${{ matrix.shard }}" | tee -a "$LOG_FILE"
 
-          # 用 --checksum 做严格一致性校验；若仍有差异，将返回非零并使分片任务失败
           rclone check "r2push:${SRC_BUCKET}" "r2dst:${DST_BUCKET}" \
             --one-way --checksum --checkers "${CHECKERS}" \
             --include "${{ matrix.shard }}" --exclude="**" \
