@@ -7,7 +7,7 @@ on:
 
 env:
   SRC_BUCKET: yasyadong001
-  DST_BUCKET: yas003
+  DST_BUCKET: yas004
 
   TRANSFERS: "4"
   CHECKERS: "16"
