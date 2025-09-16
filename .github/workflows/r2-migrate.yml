@@ -1,0 +1,109 @@
+name: R2 Migrate (one-shot, rclone)
+
+on:
+  workflow_dispatch: {}           # 手动触发
+  # 如需定时，取消下面注释（UTC 时间）
+  # schedule:
+  #   - cron: "*/30 * * * *"      # 每 30 分钟
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      # 桶名（可按需改）
+      SRC_BUCKET: yasyadong001
+      DST_BUCKET: yas003
+
+      # 速率/并发/稳定性（与你脚本一致的保守默认）
+      MIN_AGE: "60s"              # 只搬 ≥60s 前的稳定文件
+      TRANSFERS: "2"
+      CHECKERS: "4"
+      UPLOAD_CONC: "2"
+      BW_LIMIT: "10M"
+      TPS_LIMIT: "8"
+      CHUNK_SIZE: "32M"
+      COPY_CUTOFF: "256M"
+      MAX_RETRIES: "8"
+      LOW_LEVEL_RETRIES: "20"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install rclone
+        run: |
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+          rclone version
+
+      - name: Configure rclone remotes (R2 → R2)
+        env:
+          # 源 R2（push）
+          R2PUSH_ACCESS_KEY:  ${{ secrets.R2PUSH_ACCESS_KEY }}
+          R2PUSH_SECRET_KEY:  ${{ secrets.R2PUSH_SECRET_KEY }}
+          R2PUSH_ENDPOINT:    ${{ secrets.R2PUSH_ENDPOINT }}   # 例：https://44a6....r2.cloudflarestorage.com
+          # 目的 R2（dst）
+          R2DST_ACCESS_KEY:   ${{ secrets.R2DST_ACCESS_KEY }}
+          R2DST_SECRET_KEY:   ${{ secrets.R2DST_SECRET_KEY }}
+          R2DST_ENDPOINT:     ${{ secrets.R2DST_ENDPOINT }}     # 例：https://cff8....r2.cloudflarestorage.com
+        run: |
+          set -euo pipefail
+          rclone config create r2push s3 \
+            provider=Other env_auth=false \
+            access_key_id="${R2PUSH_ACCESS_KEY}" secret_access_key="${R2PUSH_SECRET_KEY}" \
+            region=auto endpoint="${R2PUSH_ENDPOINT}" \
+            s3-chunk-size="${CHUNK_SIZE}" s3-upload-concurrency="${UPLOAD_CONC}"
+
+          rclone config create r2dst s3 \
+            provider=Other env_auth=false \
+            access_key_id="${R2DST_ACCESS_KEY}" secret_access_key="${R2DST_SECRET_KEY}" \
+            region=auto endpoint="${R2DST_ENDPOINT}" \
+            s3-chunk-size="${CHUNK_SIZE}" s3-upload-concurrency="${UPLOAD_CONC}"
+
+          echo "Remotes configured:"
+          rclone listremotes
+
+      - name: One-shot copy (source → dest)
+        run: |
+          set -euo pipefail
+          mkdir -p logs
+          LOG_FILE="logs/r2_copy_$(date -u +%F_%H-%M-%S).log"
+
+          echo "[$(date -u '+%F %T')] Start copy ${SRC_BUCKET} → ${DST_BUCKET}" | tee -a "$LOG_FILE"
+
+          rclone copy "r2push:${SRC_BUCKET}" "r2dst:${DST_BUCKET}" \
+            --fast-list \
+            --metadata \
+            --size-only \
+            --min-age "${MIN_AGE}" \
+            --transfers "${TRANSFERS}" \
+            --checkers "${CHECKERS}" \
+            --bwlimit "${BW_LIMIT}" \
+            --tpslimit "${TPS_LIMIT}" \
+            --s3-chunk-size "${CHUNK_SIZE}" \
+            --s3-copy-cutoff "${COPY_CUTOFF}" \
+            --retries "${MAX_RETRIES}" \
+            --low-level-retries "${LOW_LEVEL_RETRIES}" \
+            --progress 2>&1 | tee -a "$LOG_FILE"
+
+          echo "[$(date -u '+%F %T')] Copy done." | tee -a "$LOG_FILE"
+
+      - name: Optional one-way verify (size-only)
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p logs
+          LOG_FILE="logs/r2_check_$(date -u +%F_%H-%M-%S).log"
+          echo "[$(date -u '+%F %T')] Start check (one-way, size-only)" | tee -a "$LOG_FILE"
+          rclone check "r2push:${SRC_BUCKET}" "r2dst:${DST_BUCKET}" \
+            --one-way --size-only --checkers $((CHECKERS*2)) --progress 2>&1 | tee -a "$LOG_FILE" || true
+          echo "[$(date -u '+%F %T')] Check done." | tee -a "$LOG_FILE"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: r2-migrate-logs
+          path: logs/
+          retention-days: 7
