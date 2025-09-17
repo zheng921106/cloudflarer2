@@ -1,4 +1,3 @@
-# .github/workflows/r2-migrate.yml
 name: Cloudflare R2 Bucket Migration (rclone)
 
 on:
@@ -13,7 +12,7 @@ on:
         description: "B桶名称（目标桶名）"
         required: true
         type: string
-        default: "yas005"
+        default: "yas007"   # ← 按你的实际目标桶改，和你检查用的一致
       MODE:
         description: "迁移模式：copy(仅新增/更新) 或 sync(镜像，会删除目标多余对象)"
         required: true
@@ -54,6 +53,7 @@ jobs:
       CHECKERS: ${{ inputs.CHECKERS }}
       S3_CHUNK_SIZE: ${{ inputs.S3_CHUNK_SIZE }}
       S3_UPLOAD_CUTOFF: ${{ inputs.S3_UPLOAD_CUTOFF }}
+
     steps:
       - name: Install rclone
         run: |
@@ -63,15 +63,15 @@ jobs:
       - name: Prepare rclone config
         run: |
           mkdir -p ~/.config/rclone
-          cat > ~/.config/rclone/rclone.conf <<EOF
+          cat > ~/.config/rclone/rclone.conf <<'EOF'
           [r2src]
           type = s3
           provider = Cloudflare
           access_key_id = ${R2PUSH_ACCESS_KEY}
           secret_access_key = ${R2PUSH_SECRET_KEY}
           endpoint = ${R2PUSH_ENDPOINT}
+          force_path_style = true
           acl = private
-          no_check_bucket = true
 
           [r2dst]
           type = s3
@@ -79,8 +79,8 @@ jobs:
           access_key_id = ${R2DST_ACCESS_KEY}
           secret_access_key = ${R2DST_SECRET_KEY}
           endpoint = ${R2DST_ENDPOINT}
+          force_path_style = true
           acl = private
-          no_check_bucket = true
           EOF
         env:
           R2PUSH_ACCESS_KEY: ${{ secrets.R2PUSH_ACCESS_KEY }}
@@ -90,7 +90,33 @@ jobs:
           R2DST_SECRET_KEY: ${{ secrets.R2DST_SECRET_KEY }}
           R2DST_ENDPOINT: ${{ secrets.R2DST_ENDPOINT }}
 
-      - name: Sanity check (recursive file listing)
+      - name: Preflight 1/3 — 列出账号下的所有桶（验证端点/凭证）
+        run: |
+          echo "== r2src buckets =="
+          rclone lsd r2src: || exit 2
+          echo "== r2dst buckets =="
+          rclone lsd r2dst: || exit 2
+
+      - name: Preflight 2/3 — 校验目的桶存在
+        run: |
+          if ! rclone lsd r2dst: | awk '{print $5}' | grep -Fx "${DST_BUCKET}" >/dev/null; then
+            echo "❌ 目标桶 ${DST_BUCKET} 在 r2dst 下不存在，请在 Cloudflare R2 控制台先创建，或改成已存在的桶名。"
+            exit 3
+          fi
+          echo "✅ 目标桶存在：${DST_BUCKET}"
+
+      - name: Preflight 3/3 — 写权限探测
+        run: |
+          set -e
+          echo test > /tmp/.r2_write_probe.txt
+          if ! rclone copyto /tmp/.r2_write_probe.txt r2dst:"${DST_BUCKET}"/.r2_write_probe.txt; then
+            echo "❌ 无法写入 ${DST_BUCKET}，请检查 R2DST_* 的 Token 权限（PutObject/AbortMultipartUpload 等）。"
+            exit 4
+          fi
+          rclone deletefile r2dst:"${DST_BUCKET}"/.r2_write_probe.txt || true
+          echo "✅ 写权限正常"
+
+      - name: Sanity check（递归列出前50个文件）
         run: |
           echo "Source (first 50 files):"
           rclone lsf r2src:"${SRC_BUCKET}" -R --files-only | head -n 50 || true
@@ -98,23 +124,35 @@ jobs:
           echo "Destination (first 50 files):"
           rclone lsf r2dst:"${DST_BUCKET}" -R --files-only | head -n 50 || true
 
-      - name: Run migration (real copy/sync; no dry-run; no --fast-list)
+      - name: Run migration（真实迁移；失败自动给出调试片段）
         run: |
-          # 使用 NOTICE 等级，避免 -vv 的调试噪音（含 Need to transfer...）
+          set -e
           COMMON_ARGS="-P --log-level NOTICE --stats=30s --stats-one-line \
           --transfers=${TRANSFERS} --checkers=${CHECKERS} \
           --s3-upload-cutoff=${S3_UPLOAD_CUTOFF} --s3-chunk-size=${S3_CHUNK_SIZE} \
           --metadata --retries=5 --low-level-retries=20 --retries-sleep=10s"
 
           if [[ "${MODE}" == "sync" ]]; then
-            echo ">> Running SYNC (目标将与来源完全一致，包含删除) ..."
+            echo ">> SYNC 模式：目标将与来源完全一致（包含删除多余对象）"
+            set +e
             rclone sync r2src:"${SRC_BUCKET}" r2dst:"${DST_BUCKET}" $COMMON_ARGS --delete-after
+            rc=$?
+            set -e
           else
-            echo ">> Running COPY (仅新增/更新，不删除目标多余对象) ..."
+            echo ">> COPY 模式：仅新增/更新，不删除目标多余对象"
+            set +e
             rclone copy r2src:"${SRC_BUCKET}" r2dst:"${DST_BUCKET}" $COMMON_ARGS
+            rc=$?
+            set -e
           fi
 
-      - name: Compare sizes (post-check)
+          if [[ $rc -ne 0 ]]; then
+            echo "❌ 迁移失败（rc=$rc）。输出最后200行 DEBUG 供排查："
+            rclone copy r2src:"${SRC_BUCKET}" r2dst:"${DST_BUCKET}" -vv --dump headers --retries 1 --transfers=4 --checkers=8 --size-only --dry-run | tail -n 200 || true
+            exit $rc
+          fi
+
+      - name: Compare sizes（迁移后大小对比）
         run: |
           echo "Source size:"
           rclone size r2src:"${SRC_BUCKET}" || true
