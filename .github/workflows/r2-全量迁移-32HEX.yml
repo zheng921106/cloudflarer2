@@ -5,11 +5,11 @@ on:
   workflow_dispatch:
     inputs:
       SRC_BUCKET:
-        description: "A桶名称（来源桶名）"
+        description: "yasyadong001"
         required: true
         type: string
       DST_BUCKET:
-        description: "B桶名称（目标桶名）"
+        description: "yas005"
         required: true
         type: string
       MODE:
