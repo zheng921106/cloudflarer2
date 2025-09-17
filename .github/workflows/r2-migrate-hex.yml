@@ -8,7 +8,7 @@ on:
 
 env:
   SRC_BUCKET: yasyadong001
-  DST_BUCKET: yas004
+  DST_BUCKET: yas005
 
   # 吞吐参数（小文件友好，先稳后快）
   TRANSFERS: "6"
