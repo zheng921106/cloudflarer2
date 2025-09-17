@@ -1,12 +1,18 @@
-name: 09171253 (no check, fast listing, no warnings)
+name: R2 全量迁移（32位十六进制目录，大小写皆可，不校验）
 
 on:
   workflow_dispatch: {}
 
 env:
+  # 必填：源/目标桶
   SRC_BUCKET: yasyadong001
   DST_BUCKET: yas004
 
+  # 可选：这些 32 位目录的上级前缀（例如都在 "assets" 下）
+  # 若在桶根，请留空字符串 ""（默认）
+  ROOT_PREFIX: ""
+
+  # 吞吐参数（先稳后快）
   TRANSFERS: "6"
   CHECKERS: "16"
   UPLOAD_CONC: "4"
@@ -29,6 +35,7 @@ jobs:
     steps:
       - name: 安装 rclone
         run: |
+          set -euo pipefail
           curl -fsSL https://rclone.org/install.sh | sudo bash
           rclone version
 
@@ -59,6 +66,19 @@ jobs:
           set -euo pipefail
           mkdir -p logs
 
+      - name: 源桶连通性快速自检
+        run: |
+          set -euo pipefail
+          BASE="r2src:${SRC_BUCKET}"
+          if [ -n "${ROOT_PREFIX}" ]; then
+            BASE="${BASE}/${ROOT_PREFIX%/}"
+          fi
+          echo "试列举 ${BASE} 顶层前 10 个条目（仅为连通性检查）："
+          if ! rclone lsf "${BASE}" --max-depth 1 --max 10; then
+            echo "❌ 无法列举源桶。请检查：密钥/端点/桶名/权限。" >&2
+            exit 1
+          fi
+
       - name: 确保目标桶存在
         run: |
           set -euo pipefail
@@ -69,7 +89,7 @@ jobs:
             echo "目标桶已存在：${DST_BUCKET}"
           fi
 
-      - name: 生成分片过滤规则（仅 32 位十六进制目录）
+      - name: 生成分片过滤规则（32位十六进制目录，支持大小写）
         id: buildfilter
         run: |
           set -euo pipefail
@@ -77,32 +97,52 @@ jobs:
           FILTER="filters/${{ matrix.shard }}.filter"
           : > "$FILTER"
 
-          # 只列举当前首字符的顶层“目录”
-          rclone lsf "r2src:${SRC_BUCKET}/${{ matrix.shard }}" --dirs-only --max-depth 1 > shard_dirs.txt || true
+          # 计算基础前缀路径
+          BASE="r2src:${SRC_BUCKET}"
+          if [ -n "${ROOT_PREFIX}" ]; then
+            BASE="${BASE}/${ROOT_PREFIX%/}"
+          fi
 
-          # 选出 32 位十六进制目录（大小写均可）
-          awk 'BEGIN{IGNORECASE=1} /^[0-9A-F]{32}\/$/ {print}' shard_dirs.txt > matched_dirs.txt
+          # 当前分片的大写与小写
+          UP="${{ matrix.shard }}"
+          LOW="$(printf '%s' "${{ matrix.shard }}" | tr 'A-Z' 'a-z')"
+
+          # 只列举以当前分片开头的顶层“目录”（分别列举大写和小写前缀）
+          : > shard_dirs.txt
+          rclone lsf "${BASE}/${UP}"  --dirs-only --max-depth 1 >> shard_dirs.txt || true
+          if [ "${LOW}" != "${UP}" ]; then
+            rclone lsf "${BASE}/${LOW}" --dirs-only --max-depth 1 >> shard_dirs.txt || true
+          fi
+
+          # 过滤出：名字为 32 位十六进制的目录（行以 / 结尾）
+          awk 'BEGIN{IGNORECASE=1} /^[0-9A-F]{32}\/$/ {print}' shard_dirs.txt | sort -u > matched_dirs.txt
 
           cnt=$(wc -l < matched_dirs.txt | tr -d " ")
-          echo "分片 ${{ matrix.shard }} 命中目录数量：$cnt"
+          echo "分片 '${{ matrix.shard }}' 命中目录数：$cnt"
           head -50 matched_dirs.txt || true
 
           if [ "$cnt" -gt 0 ]; then
-            while IFS= read -r d; do
-              printf "+ %s**\n" "$d"
-            done < matched_dirs.txt > "$FILTER"
+            if [ -n "${ROOT_PREFIX}" ]; then
+              # 带上上级前缀
+              while IFS= read -r d; do
+                printf "+ %s/%s**\n" "${ROOT_PREFIX%/}" "$d"
+              done < matched_dirs.txt > "$FILTER"
+            else
+              while IFS= read -r d; do
+                printf "+ %s**\n" "$d"
+              done < matched_dirs.txt > "$FILTER"
+            fi
             echo "- **" >> "$FILTER"
             echo "file=$FILTER" >> "$GITHUB_OUTPUT"
             echo "empty=false" >> "$GITHUB_OUTPUT"
           else
-            # 空分片：写一条跳过日志，避免后续上传时报“找不到文件”
             echo "# empty shard" > "$FILTER"
             echo "本分片(${{ matrix.shard }})无匹配目录，跳过。" > "logs/skip_${{ matrix.shard }}.log"
             echo "file=$FILTER" >> "$GITHUB_OUTPUT"
             echo "empty=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: 执行迁移（不校验）
+      - name: 执行迁移（只复制，不校验）
         if: steps.buildfilter.outputs.empty == 'false'
         run: |
           set -euo pipefail
@@ -117,10 +157,10 @@ jobs:
             --s3-chunk-size "${CHUNK_SIZE}" --s3-copy-cutoff "${COPY_CUTOFF}" \
             --retries "${MAX_RETRIES}" --low-level-retries "${LOW_LEVEL_RETRIES}" \
             --progress 2>&1 | tee -a "$LOG"
-            # 如需避免搬运正在写入的文件：
+            # 若要避开正在写入的文件，打开下一行：
             # --min-age "${MIN_AGE}"
 
-      - name: 上传日志（仅当非空分片）
+      - name: 上传日志（非空分片）
         if: ${{ always() && steps.buildfilter.outputs.empty == 'false' }}
         uses: actions/upload-artifact@v4
         with:
@@ -129,7 +169,7 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-      - name: 上传跳过日志（仅当空分片）
+      - name: 上传日志（空分片）
         if: ${{ always() && steps.buildfilter.outputs.empty == 'true' }}
         uses: actions/upload-artifact@v4
         with:
