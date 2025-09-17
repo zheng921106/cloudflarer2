@@ -13,7 +13,7 @@ on:
         description: "B桶名称（目标桶名）"
         required: true
         type: string
-        default: ""
+        default: "yas005"
       MODE:
         description: "迁移模式：copy(仅新增/更新) 或 sync(镜像，会删除目标多余对象)"
         required: true
@@ -43,7 +43,7 @@ on:
 
 jobs:
   migrate:
-    name: R2 A→B Migration (with .m3u8/.shtml priority)
+    name: Migrate A→B with rclone
     runs-on: ubuntu-latest
     timeout-minutes: 1440
     env:
@@ -54,7 +54,6 @@ jobs:
       CHECKERS: ${{ inputs.CHECKERS }}
       S3_CHUNK_SIZE: ${{ inputs.S3_CHUNK_SIZE }}
       S3_UPLOAD_CUTOFF: ${{ inputs.S3_UPLOAD_CUTOFF }}
-
     steps:
       - name: Install rclone
         run: |
@@ -64,14 +63,13 @@ jobs:
       - name: Prepare rclone config
         run: |
           mkdir -p ~/.config/rclone
-          cat > ~/.config/rclone/rclone.conf <<'EOF'
+          cat > ~/.config/rclone/rclone.conf <<EOF
           [r2src]
           type = s3
           provider = Cloudflare
           access_key_id = ${R2PUSH_ACCESS_KEY}
           secret_access_key = ${R2PUSH_SECRET_KEY}
           endpoint = ${R2PUSH_ENDPOINT}
-          region = auto
           acl = private
           no_check_bucket = true
 
@@ -81,7 +79,6 @@ jobs:
           access_key_id = ${R2DST_ACCESS_KEY}
           secret_access_key = ${R2DST_SECRET_KEY}
           endpoint = ${R2DST_ENDPOINT}
-          region = auto
           acl = private
           no_check_bucket = true
           EOF
@@ -93,92 +90,35 @@ jobs:
           R2DST_SECRET_KEY: ${{ secrets.R2DST_SECRET_KEY }}
           R2DST_ENDPOINT: ${{ secrets.R2DST_ENDPOINT }}
 
-      - name: Quick list (prove there are real files)
+      - name: Sanity check (recursive file listing)
         run: |
-          echo "== Source sample files (.m3u8/.shtml) =="
-          rclone lsf r2src:"${SRC_BUCKET}" -R --files-only --include "**/*.m3u8" --include "**/*.shtml" | head -n 50 || true
+          echo "Source (first 50 files):"
+          rclone lsf r2src:"${SRC_BUCKET}" -R --files-only | head -n 50 || true
+          echo
+          echo "Destination (first 50 files):"
+          rclone lsf r2dst:"${DST_BUCKET}" -R --files-only | head -n 50 || true
 
-      - name: Build commands
-        id: build
-        shell: bash
+      - name: Run migration (real copy/sync; no dry-run; no --fast-list)
         run: |
-          set -euo pipefail
-          # 日志等级用 NOTICE，去掉 -vv 的“Need to transfer …”噪音
-          COMMON_ARGS="--log-level NOTICE -P --stats=30s --stats-one-line \
+          # 使用 NOTICE 等级，避免 -vv 的调试噪音（含 Need to transfer...）
+          COMMON_ARGS="-P --log-level NOTICE --stats=30s --stats-one-line \
           --transfers=${TRANSFERS} --checkers=${CHECKERS} \
           --s3-upload-cutoff=${S3_UPLOAD_CUTOFF} --s3-chunk-size=${S3_CHUNK_SIZE} \
-          --metadata --retries=5 --low-level-retries=20 --retries-sleep=10s \
-          --s3-no-check-bucket --s3-region=auto"
+          --metadata --retries=5 --low-level-retries=20 --retries-sleep=10s"
 
           if [[ "${MODE}" == "sync" ]]; then
-            BASE_CMD="rclone sync r2src:\"${SRC_BUCKET}\" r2dst:\"${DST_BUCKET}\" ${COMMON_ARGS} --delete-after"
+            echo ">> Running SYNC (目标将与来源完全一致，包含删除) ..."
+            rclone sync r2src:"${SRC_BUCKET}" r2dst:"${DST_BUCKET}" $COMMON_ARGS --delete-after
           else
-            BASE_CMD="rclone copy r2src:\"${SRC_BUCKET}\" r2dst:\"${DST_BUCKET}\" ${COMMON_ARGS}"
-          fi
-
-          # 专项：仅迁移 .m3u8 / .shtml
-          EXT_FILTERS=(--include "**/*.m3u8" --include "**/*.shtml")
-          CMD_EXT_PRIMARY="${BASE_CMD} ${EXT_FILTERS[*]}"
-          CMD_EXT_FALLBACK="${CMD_EXT_PRIMARY} --disable-http2 --s3-force-path-style"
-
-          # 全量（不带过滤）
-          CMD_ALL_PRIMARY="${BASE_CMD}"
-          CMD_ALL_FALLBACK="${CMD_ALL_PRIMARY} --disable-http2 --s3-force-path-style"
-
-          echo "ext_primary=${CMD_EXT_PRIMARY}"     >> $GITHUB_OUTPUT
-          echo "ext_fallback=${CMD_EXT_FALLBACK}"   >> $GITHUB_OUTPUT
-          echo "all_primary=${CMD_ALL_PRIMARY}"     >> $GITHUB_OUTPUT
-          echo "all_fallback=${CMD_ALL_FALLBACK}"   >> $GITHUB_OUTPUT
-
-      - name: Transfer critical extensions first (.m3u8/.shtml)
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo ">> COPY .m3u8/.shtml (PRIMARY)"
-          if timeout 15m bash -lc '${{ steps.build.outputs.ext_primary }}'; then
-            echo "Critical extensions copied (primary)."
-          else
-            RC=$?
-            echo "Primary timed out/failed ($RC). Trying FALLBACK (disable http2 + path-style)..."
-            ${{ steps.build.outputs.ext_fallback }}
-          fi
-
-      - name: Verify .m3u8/.shtml presence (strict)
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p verify
-          rclone lsf r2src:"${SRC_BUCKET}" -R --files-only --include "**/*.m3u8" --include "**/*.shtml" | sort > verify/src_ext.lst
-          rclone lsf r2dst:"${DST_BUCKET}" -R --files-only --include "**/*.m3u8" --include "**/*.shtml" | sort > verify/dst_ext.lst
-          # 找出在源有但目标没有的键
-          comm -23 verify/src_ext.lst verify/dst_ext.lst > verify/missing_ext.lst || true
-          MISSING=$(wc -l < verify/missing_ext.lst | tr -d ' ')
-          echo "Missing .m3u8/.shtml count: ${MISSING}"
-          if [[ "${MISSING}" != "0" ]]; then
-            echo "Top 100 missing:"
-            head -n 100 verify/missing_ext.lst || true
-            echo "::error::There are ${MISSING} .m3u8/.shtml files missing at destination."
-            exit 1
-          fi
-          echo "All .m3u8/.shtml verified at destination."
-
-      - name: Run bulk migration (other files)
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo ">> BULK COPY (all remaining files)"
-          if timeout 60m bash -lc '${{ steps.build.outputs.all_primary }}'; then
-            echo "Bulk copy completed (primary)."
-          else
-            RC=$?
-            echo "Primary timed out/failed ($RC). Trying FALLBACK (disable http2 + path-style)..."
-            ${{ steps.build.outputs.all_fallback }}
+            echo ">> Running COPY (仅新增/更新，不删除目标多余对象) ..."
+            rclone copy r2src:"${SRC_BUCKET}" r2dst:"${DST_BUCKET}" $COMMON_ARGS
           fi
 
       - name: Compare sizes (post-check)
         run: |
-          echo "== Post sizes =="
+          echo "Source size:"
           rclone size r2src:"${SRC_BUCKET}" || true
+          echo "Destination size:"
           rclone size r2dst:"${DST_BUCKET}" || true
 
       - name: Emit summary
