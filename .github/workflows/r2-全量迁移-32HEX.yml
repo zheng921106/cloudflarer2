@@ -5,13 +5,15 @@ on:
   workflow_dispatch:
     inputs:
       SRC_BUCKET:
-        description: "yasyadong001"
+        description: "A桶名称（来源桶名）"
         required: true
         type: string
+        default: "yasyadong001"
       DST_BUCKET:
-        description: "yas005"
+        description: "B桶名称（目标桶名）"
         required: true
         type: string
+        default: "yas005"
       MODE:
         description: "迁移模式：copy(仅新增/更新) 或 sync(镜像，会删除目标多余对象)"
         required: true
@@ -43,7 +45,7 @@ jobs:
   migrate:
     name: Migrate A→B with rclone
     runs-on: ubuntu-latest
-    timeout-minutes: 1440  # 最长 24h，可按需调整
+    timeout-minutes: 1440
     env:
       SRC_BUCKET: ${{ inputs.SRC_BUCKET }}
       DST_BUCKET: ${{ inputs.DST_BUCKET }}
@@ -88,21 +90,29 @@ jobs:
           R2DST_SECRET_KEY: ${{ secrets.R2DST_SECRET_KEY }}
           R2DST_ENDPOINT: ${{ secrets.R2DST_ENDPOINT }}
 
-      - name: Sanity check (list first 20 objects)
+      - name: Sanity check (recursive file listing)
         run: |
-          echo "Listing source bucket: ${SRC_BUCKET}"
-          rclone lsf r2src:"${SRC_BUCKET}" | head -n 20 || true
-          echo "Listing destination bucket: ${DST_BUCKET}"
-          rclone lsf r2dst:"${DST_BUCKET}" | head -n 20 || true
+          echo "Source (first 50 files):"
+          rclone lsf r2src:"${SRC_BUCKET}" -R --files-only | head -n 50 || true
+          echo
+          echo "Destination (first 50 files):"
+          rclone lsf r2dst:"${DST_BUCKET}" -R --files-only | head -n 50 || true
 
-      - name: Run migration
+      - name: Run migration (real copy/sync; no dry-run; no --fast-list)
         run: |
-          COMMON_ARGS="-P --transfers=${TRANSFERS} --checkers=${CHECKERS} --fast-list \
-          --s3-upload-cutoff=${S3_UPLOAD_CUTOFF} --s3-chunk-size=${S3_CHUNK_SIZE} --metadata"
+          # 说明：
+          # 1) 去掉 --fast-list，边列举边传，避免长时间 0 B/0 B 的假象
+          # 2) -vv 输出详细日志；--stats 两行好懂；加重试参数更稳
+          COMMON_ARGS="-P -vv --stats=30s --stats-one-line \
+          --transfers=${TRANSFERS} --checkers=${CHECKERS} \
+          --s3-upload-cutoff=${S3_UPLOAD_CUTOFF} --s3-chunk-size=${S3_CHUNK_SIZE} \
+          --metadata --retries=5 --low-level-retries=20 --retries-sleep=10s"
 
           if [[ "${MODE}" == "sync" ]]; then
+            echo ">> Running SYNC (目标将与来源完全一致，包含删除) ..."
             rclone sync r2src:"${SRC_BUCKET}" r2dst:"${DST_BUCKET}" $COMMON_ARGS --delete-after
           else
+            echo ">> Running COPY (仅新增/更新，不删除目标多余对象) ..."
             rclone copy r2src:"${SRC_BUCKET}" r2dst:"${DST_BUCKET}" $COMMON_ARGS
           fi
 
@@ -124,8 +134,8 @@ jobs:
             echo "- Transfers: \`${TRANSFERS}\` | Checkers: \`${CHECKERS}\`"
             echo "- s3-chunk-size: \`${S3_CHUNK_SIZE}\` | s3-upload-cutoff: \`${S3_UPLOAD_CUTOFF}\`"
             echo ""
-            echo "#### Sample listing"
+            echo "#### Destination sample (first 100 files)"
             echo "\`\`\`"
-            rclone lsf r2dst:"${DST_BUCKET}" | head -n 50 || true
+            rclone lsf r2dst:"${DST_BUCKET}" -R --files-only | head -n 100 || true
             echo "\`\`\`"
           } >> $GITHUB_STEP_SUMMARY
