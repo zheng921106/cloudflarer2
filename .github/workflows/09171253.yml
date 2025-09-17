@@ -1,0 +1,139 @@
+name: 09171253 (no check, fast listing, no warnings)
+
+on:
+  workflow_dispatch: {}
+
+env:
+  SRC_BUCKET: yasyadong001
+  DST_BUCKET: yas004
+
+  TRANSFERS: "6"
+  CHECKERS: "16"
+  UPLOAD_CONC: "4"
+  BW_LIMIT: "0"
+  TPS_LIMIT: "16"
+  CHUNK_SIZE: "32M"
+  COPY_CUTOFF: "256M"
+  MAX_RETRIES: "8"
+  LOW_LEVEL_RETRIES: "20"
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [ "0","1","2","3","4","5","6","7","8","9","A","B","C","D","E","F" ]
+
+    steps:
+      - name: 安装 rclone
+        run: |
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+          rclone version
+
+      - name: 配置 R2 源与目标
+        env:
+          R2PUSH_ACCESS_KEY:  ${{ secrets.R2PUSH_ACCESS_KEY }}
+          R2PUSH_SECRET_KEY:  ${{ secrets.R2PUSH_SECRET_KEY }}
+          R2PUSH_ENDPOINT:    ${{ secrets.R2PUSH_ENDPOINT }}
+          R2DST_ACCESS_KEY:   ${{ secrets.R2DST_ACCESS_KEY }}
+          R2DST_SECRET_KEY:   ${{ secrets.R2DST_SECRET_KEY }}
+          R2DST_ENDPOINT:     ${{ secrets.R2DST_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          rclone config create r2src s3 \
+            provider=Other env_auth=false \
+            access_key_id="${R2PUSH_ACCESS_KEY}" secret_access_key="${R2PUSH_SECRET_KEY}" \
+            region=auto endpoint="${R2PUSH_ENDPOINT}" \
+            s3-chunk-size="${CHUNK_SIZE}" s3-upload-concurrency="${UPLOAD_CONC}"
+          rclone config create r2dst s3 \
+            provider=Other env_auth=false \
+            access_key_id="${R2DST_ACCESS_KEY}" secret_access_key="${R2DST_SECRET_KEY}" \
+            region=auto endpoint="${R2DST_ENDPOINT}" \
+            s3-chunk-size="${CHUNK_SIZE}" s3-upload-concurrency="${UPLOAD_CONC}"
+          rclone listremotes
+
+      - name: 准备日志目录
+        run: |
+          set -euo pipefail
+          mkdir -p logs
+
+      - name: 确保目标桶存在
+        run: |
+          set -euo pipefail
+          if ! rclone lsd "r2dst:" | grep -qE "\s${DST_BUCKET}\s*$"; then
+            echo "创建目标桶：${DST_BUCKET}"
+            rclone mkdir "r2dst:${DST_BUCKET}"
+          else
+            echo "目标桶已存在：${DST_BUCKET}"
+          fi
+
+      - name: 生成分片过滤规则（仅 32 位十六进制目录）
+        id: buildfilter
+        run: |
+          set -euo pipefail
+          mkdir -p filters
+          FILTER="filters/${{ matrix.shard }}.filter"
+          : > "$FILTER"
+
+          # 只列举当前首字符的顶层“目录”
+          rclone lsf "r2src:${SRC_BUCKET}/${{ matrix.shard }}" --dirs-only --max-depth 1 > shard_dirs.txt || true
+
+          # 选出 32 位十六进制目录（大小写均可）
+          awk 'BEGIN{IGNORECASE=1} /^[0-9A-F]{32}\/$/ {print}' shard_dirs.txt > matched_dirs.txt
+
+          cnt=$(wc -l < matched_dirs.txt | tr -d " ")
+          echo "分片 ${{ matrix.shard }} 命中目录数量：$cnt"
+          head -50 matched_dirs.txt || true
+
+          if [ "$cnt" -gt 0 ]; then
+            while IFS= read -r d; do
+              printf "+ %s**\n" "$d"
+            done < matched_dirs.txt > "$FILTER"
+            echo "- **" >> "$FILTER"
+            echo "file=$FILTER" >> "$GITHUB_OUTPUT"
+            echo "empty=false" >> "$GITHUB_OUTPUT"
+          else
+            # 空分片：写一条跳过日志，避免后续上传时报“找不到文件”
+            echo "# empty shard" > "$FILTER"
+            echo "本分片(${{ matrix.shard }})无匹配目录，跳过。" > "logs/skip_${{ matrix.shard }}.log"
+            echo "file=$FILTER" >> "$GITHUB_OUTPUT"
+            echo "empty=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 执行迁移（不校验）
+        if: steps.buildfilter.outputs.empty == 'false'
+        run: |
+          set -euo pipefail
+          LOG="logs/migrate_${{ matrix.shard }}_$(date -u +%F_%H-%M-%S).log"
+          echo "开始迁移：分片=${{ matrix.shard }}  规则=${{ steps.buildfilter.outputs.file }}" | tee -a "$LOG"
+
+          rclone copy "r2src:${SRC_BUCKET}" "r2dst:${DST_BUCKET}" \
+            --fast-list --metadata \
+            --filter-from "${{ steps.buildfilter.outputs.file }}" \
+            --transfers "${TRANSFERS}" --checkers "${CHECKERS}" \
+            --bwlimit "${BW_LIMIT}" --tpslimit "${TPS_LIMIT}" \
+            --s3-chunk-size "${CHUNK_SIZE}" --s3-copy-cutoff "${COPY_CUTOFF}" \
+            --retries "${MAX_RETRIES}" --low-level-retries "${LOW_LEVEL_RETRIES}" \
+            --progress 2>&1 | tee -a "$LOG"
+            # 如需避免搬运正在写入的文件：
+            # --min-age "${MIN_AGE}"
+
+      - name: 上传日志（仅当非空分片）
+        if: ${{ always() && steps.buildfilter.outputs.empty == 'false' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: 迁移日志-${{ matrix.shard }}
+          path: logs/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: 上传跳过日志（仅当空分片）
+        if: ${{ always() && steps.buildfilter.outputs.empty == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: 迁移日志-空分片-${{ matrix.shard }}
+          path: logs/
+          if-no-files-found: ignore
+          retention-days: 7
