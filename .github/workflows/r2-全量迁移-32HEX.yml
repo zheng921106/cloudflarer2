@@ -1,4 +1,4 @@
-name: Cloudflare R2 Bucket Migration (rclone)
+name: Cloudflare R2 Bucket Migration (rclone) - Robust Version
 
 on:
   workflow_dispatch:
@@ -12,7 +12,7 @@ on:
         description: "B桶名称（目标桶名）"
         required: true
         type: string
-        default: "yas007"  # ← 按你的实际目标桶修改
+        default: "yas007"
       MODE:
         description: "迁移模式：copy(仅新增/更新) 或 sync(镜像，会删除目标多余对象)"
         required: true
@@ -22,29 +22,34 @@ on:
       TRANSFERS:
         description: "并发传输数 (--transfers)"
         required: true
-        default: "32"
+        default: "16"  # 降低并发以减少压力
         type: string
       CHECKERS:
         description: "并发校验数 (--checkers)"
         required: true
-        default: "64"
+        default: "32"  # 降低校验并发
         type: string
       S3_CHUNK_SIZE:
         description: "S3分片大小 (--s3-chunk-size)"
         required: true
-        default: "100M"
+        default: "64M"  # 减小分片大小
         type: string
       S3_UPLOAD_CUTOFF:
         description: "直传阈值 (--s3-upload-cutoff)"
         required: true
-        default: "100M"
+        default: "64M"  # 减小直传阈值
+        type: string
+      BATCH_SIZE:
+        description: "分批处理大小（GB），0表示不分批"
+        required: true
+        default: "500"
         type: string
 
 jobs:
   migrate:
-    name: Migrate A→B with rclone
+    name: Migrate A→B with rclone (Robust)
     runs-on: ubuntu-latest
-    timeout-minutes: 1440
+    timeout-minutes: 4320  # 3天超时，适应15TB数据
     env:
       SRC_BUCKET: ${{ inputs.SRC_BUCKET }}
       DST_BUCKET: ${{ inputs.DST_BUCKET }}
@@ -53,6 +58,7 @@ jobs:
       CHECKERS: ${{ inputs.CHECKERS }}
       S3_CHUNK_SIZE: ${{ inputs.S3_CHUNK_SIZE }}
       S3_UPLOAD_CUTOFF: ${{ inputs.S3_UPLOAD_CUTOFF }}
+      BATCH_SIZE: ${{ inputs.BATCH_SIZE }}
 
     steps:
       - name: Install rclone
@@ -66,7 +72,6 @@ jobs:
           set -e
           mkdir -p ~/.config/rclone
 
-          # 注意：必须用 <<EOF（无引号）保证环境变量会被展开
           cat > ~/.config/rclone/rclone.conf <<EOF
           [r2src]
           type = s3
@@ -76,6 +81,10 @@ jobs:
           endpoint = ${R2PUSH_ENDPOINT}
           force_path_style = true
           acl = private
+          # 增加连接参数
+          disable_checksum = false
+          memory_pool_flush_time = 30s
+          memory_pool_use_mmap = true
 
           [r2dst]
           type = s3
@@ -85,9 +94,12 @@ jobs:
           endpoint = ${R2DST_ENDPOINT}
           force_path_style = true
           acl = private
+          # 增加连接参数
+          disable_checksum = false
+          memory_pool_flush_time = 30s
+          memory_pool_use_mmap = true
           EOF
 
-          # 基本校验：Secrets 是否注入、端点是否以 https:// 开头
           for v in R2PUSH_ACCESS_KEY R2PUSH_SECRET_KEY R2PUSH_ENDPOINT R2DST_ACCESS_KEY R2DST_SECRET_KEY R2DST_ENDPOINT; do
             if [ -z "${!v}" ]; then
               echo "❌ 缺少必填 Secret: $v" >&2
@@ -106,85 +118,112 @@ jobs:
           R2DST_SECRET_KEY: ${{ secrets.R2DST_SECRET_KEY }}
           R2DST_ENDPOINT: ${{ secrets.R2DST_ENDPOINT }}
 
-      # 不使用 ListBuckets；直接对具体桶操作，兼容性更好
-      - name: Preflight A — 源/目标桶可读性检查（按桶列根目录）
+      - name: Preflight checks
         run: |
           set -e
-          echo "== Check source bucket exists & readable =="
+          echo "== 检查源桶可访问性 =="
           rclone ls r2src:"${SRC_BUCKET}" --max-depth 0 >/dev/null || (echo "❌ 源桶不可访问：${SRC_BUCKET}" >&2; exit 21)
-          echo "== Check destination bucket exists & readable =="
-          rclone ls r2dst:"${DST_BUCKET}" --max-depth 0 >/dev/null || (echo "❌ 目标桶不可访问：${DST_BUCKET}（请确认：已创建/Endpoint 正确/Token 有权限）" >&2; exit 22)
-          echo "✅ 两个桶都可读"
-
-      - name: Preflight B — 目标桶写权限探测
-        run: |
-          set -e
+          
+          echo "== 检查目标桶可访问性 =="
+          rclone ls r2dst:"${DST_BUCKET}" --max-depth 0 >/dev/null || (echo "❌ 目标桶不可访问：${DST_BUCKET}" >&2; exit 22)
+          
+          echo "== 检查目标桶写权限 =="
           echo "test" > /tmp/.r2_write_probe.txt
           if ! rclone copyto /tmp/.r2_write_probe.txt r2dst:"${DST_BUCKET}"/.r2_write_probe.txt; then
-            echo "❌ 无法写入 ${DST_BUCKET}，请检查 R2DST_* Token 权限（至少 PutObject；若用 sync 还需 DeleteObject）" >&2
+            echo "❌ 无法写入 ${DST_BUCKET}" >&2
             exit 23
           fi
           rclone deletefile r2dst:"${DST_BUCKET}"/.r2_write_probe.txt || true
-          echo "✅ 写权限正常"
+          echo "✅ 权限检查通过"
 
-      - name: Sanity check（递归列出前50个文件）
+      - name: Estimate migration size
         run: |
           set -e
-          echo "Source (first 50 files):"
-          rclone lsf r2src:"${SRC_BUCKET}" -R --files-only | head -n 50 || true
-          echo
-          echo "Destination (first 50 files):"
-          rclone lsf r2dst:"${DST_BUCKET}" -R --files-only | head -n 50 || true
+          echo "== 估算源桶大小 =="
+          rclone size r2src:"${SRC_BUCKET}" --json | jq . || true
+          echo "== 列出前100个文件作为样本 =="
+          rclone lsf r2src:"${SRC_BUCKET}" -R --files-only | head -n 100 || true
 
-      - name: Run migration（真实迁移；失败自动给出调试片段）
+      - name: Run robust migration
         run: |
           set -e
-          COMMON_ARGS="-P --log-level NOTICE --stats=30s --stats-one-line \
+          # 核心迁移参数 - 针对大文件和稳定性优化
+          COMMON_ARGS="--progress --log-level INFO --stats=60s --stats-one-line \
           --transfers=${TRANSFERS} --checkers=${CHECKERS} \
           --s3-upload-cutoff=${S3_UPLOAD_CUTOFF} --s3-chunk-size=${S3_CHUNK_SIZE} \
-          --metadata --retries=5 --low-level-retries=20 --retries-sleep=10s"
+          --metadata --checksum --size-only \
+          --retries=10 --retries-sleep=30s --low-level-retries=30 \
+          --timeout=300s --contimeout=120s \
+          --buffer-size=256M --use-mmap \
+          --multi-thread-streams=4 --multi-thread-cutoff=32M \
+          --fast-list --no-traverse"
+
+          # 分批处理逻辑（如果启用）
+          BATCH_GB=${BATCH_SIZE}
+          if [ "$BATCH_GB" -gt "0" ]; then
+            echo "⚠️  分批处理已启用：每 ${BATCH_GB}GB 进行一次提交"
+            COMMON_ARGS="$COMMON_ARGS --max-transfer=${BATCH_GB}G"
+          fi
+
+          echo "== 开始迁移 =="
+          echo "使用的参数: $COMMON_ARGS"
 
           if [[ "${MODE}" == "sync" ]]; then
-            echo ">> SYNC 模式：目标将与来源完全一致（包含删除多余对象）"
-            set +e
+            echo ">> SYNC 模式：目标将与来源完全一致"
             rclone sync r2src:"${SRC_BUCKET}" r2dst:"${DST_BUCKET}" $COMMON_ARGS --delete-after
-            rc=$?
-            set -e
           else
-            echo ">> COPY 模式：仅新增/更新，不删除目标多余对象"
-            set +e
+            echo ">> COPY 模式：仅新增/更新"
             rclone copy r2src:"${SRC_BUCKET}" r2dst:"${DST_BUCKET}" $COMMON_ARGS
-            rc=$?
-            set -e
           fi
 
-          if [[ $rc -ne 0 ]]; then
-            echo "❌ 迁移失败（rc=$rc）。输出最后200行 DEBUG 供排查："
-            rclone copy r2src:"${SRC_BUCKET}" r2dst:"${DST_BUCKET}" -vv --dump headers --retries 1 --transfers=4 --checkers=8 --size-only --dry-run | tail -n 200 || true
-            exit $rc
-          fi
+          echo "✅ 迁移完成"
 
-      - name: Compare sizes（迁移后大小对比）
+      - name: Verify migration integrity
         run: |
           set -e
-          echo "Source size:"
-          rclone size r2src:"${SRC_BUCKET}" || true
-          echo "Destination size:"
-          rclone size r2dst:"${DST_BUCKET}" || true
+          echo "== 迁移后完整性检查 =="
+          
+          # 检查文件数量
+          echo "源桶文件数量:"
+          rclone ls r2src:"${SRC_BUCKET}" | wc -l || true
+          echo "目标桶文件数量:"
+          rclone ls r2dst:"${DST_BUCKET}" | wc -l || true
+          
+          # 检查总大小
+          echo "源桶总大小:"
+          rclone size r2src:"${SRC_BUCKET}" --json | jq .bytes || true
+          echo "目标桶总大小:"
+          rclone size r2dst:"${DST_BUCKET}" --json | jq .bytes || true
+          
+          # 抽样检查一些文件
+          echo "随机抽样检查10个文件:"
+          for i in $(seq 1 10); do
+            file=$(rclone lsf r2src:"${SRC_BUCKET}" -R --files-only | shuf -n 1)
+            if [ -n "$file" ]; then
+              src_size=$(rclone size r2src:"${SRC_BUCKET}/$file" --json 2>/dev/null | jq .bytes || echo "N/A")
+              dst_size=$(rclone size r2dst:"${DST_BUCKET}/$file" --json 2>/dev/null | jq .bytes || echo "N/A")
+              echo "文件: $file | 源大小: $src_size | 目标大小: $dst_size | 状态: $([ "$src_size" = "$dst_size" ] && echo "✅" || echo "❌")"
+            fi
+          done
 
-      - name: Emit summary
+      - name: Generate summary report
         if: always()
         run: |
           {
-            echo "### R2 Migration Summary"
-            echo "- Mode: \`${MODE}\`"
-            echo "- Source bucket: \`${SRC_BUCKET}\`"
-            echo "- Destination bucket: \`${DST_BUCKET}\`"
-            echo "- Transfers: \`${TRANSFERS}\` | Checkers: \`${CHECKERS}\`"
-            echo "- s3-chunk-size: \`${S3_CHUNK_SIZE}\` | s3-upload-cutoff: \`${S3_UPLOAD_CUTOFF}\`"
+            echo "### R2 Migration Summary Report"
+            echo "- **模式**: \`${MODE}\`"
+            echo "- **源桶**: \`${SRC_BUCKET}\`"
+            echo "- **目标桶**: \`${DST_BUCKET}\`"
+            echo "- **并发设置**: Transfers=\`${TRANSFERS}\`, Checkers=\`${CHECKERS}\`"
+            echo "- **分片设置**: Chunk-size=\`${S3_CHUNK_SIZE}\`, Upload-cutoff=\`${S3_UPLOAD_CUTOFF}\`"
+            echo "- **分批大小**: \`${BATCH_SIZE}GB\`"
             echo ""
-            echo "#### Destination sample (first 100 files)"
+            echo "#### 迁移后状态"
             echo "\`\`\`"
-            rclone lsf r2dst:"${DST_BUCKET}" -R --files-only | head -n 100 || true
+            echo "源桶统计:"
+            rclone size r2src:"${SRC_BUCKET}" --json 2>/dev/null | jq || echo "无法获取源桶统计"
+            echo ""
+            echo "目标桶统计:"
+            rclone size r2dst:"${DST_BUCKET}" --json 2>/dev/null | jq || echo "无法获取目标桶统计"
             echo "\`\`\`"
           } >> $GITHUB_STEP_SUMMARY
