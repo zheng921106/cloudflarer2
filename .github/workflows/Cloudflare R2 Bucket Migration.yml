@@ -1,0 +1,271 @@
+name: Cloudflare R2 Bucket Migration (rclone) - Optimized Version
+
+on:
+  workflow_dispatch:
+    inputs:
+      SRC_BUCKET:
+        description: "A桶名称（来源桶名）"
+        required: true
+        type: string
+        default: "yasyadong001"
+      DST_BUCKET:
+        description: "B桶名称（目标桶名）"
+        required: true
+        type: string
+        default: "yas009"
+      MODE:
+        description: "迁移模式"
+        required: true
+        default: "copy"
+        type: choice
+        options: ["copy", "sync"]
+      TRANSFERS:
+        description: "并发传输数"
+        required: true
+        default: "32"
+        type: string
+      CHECKERS:
+        description: "并发校验数"
+        required: true
+        default: "64"
+        type: string
+      CUTOFF_SIZE:
+        description: "分块大小"
+        required: true
+        default: "256M"
+        type: string
+      CHUNK_SIZE:
+        description: "块大小"
+        required: true
+        default: "128M"
+        type: string
+
+jobs:
+  migrate:
+    name: Optimized R2 Migration
+    runs-on: ubuntu-latest-16core  # 使用更高配置的runner
+    timeout-minutes: 10080  # 7天超时
+    env:
+      SRC_BUCKET: ${{ inputs.SRC_BUCKET }}
+      DST_BUCKET: ${{ inputs.DST_BUCKET }}
+      MODE: ${{ inputs.MODE }}
+      TRANSFERS: ${{ inputs.TRANSFERS }}
+      CHECKERS: ${{ inputs.CHECKERS }}
+      CUTOFF_SIZE: ${{ inputs.CUTOFF_SIZE }}
+      CHUNK_SIZE: ${{ inputs.CHUNK_SIZE }}
+
+    steps:
+      - name: Install rclone and dependencies
+        run: |
+          set -e
+          # 安装最新版rclone
+          curl -fsSL https://rclone.org/install.sh | sudo bash -s beta
+          rclone version
+          
+          # 安装性能监控工具
+          sudo apt-get update
+          sudo apt-get install -y htop iotop iftop jq
+
+      - name: Prepare rclone config
+        run: |
+          set -e
+          mkdir -p ~/.config/rclone
+
+          cat > ~/.config/rclone/rclone.conf <<EOF
+          [r2src]
+          type = s3
+          provider = Cloudflare
+          access_key_id = ${R2PUSH_ACCESS_KEY}
+          secret_access_key = ${R2PUSH_SECRET_KEY}
+          endpoint = ${R2PUSH_ENDPOINT}
+          force_path_style = true
+          acl = private
+          chunk_size = ${CHUNK_SIZE}
+          upload_cutoff = ${CUTOFF_SIZE}
+          no_check_bucket = true
+          memory_pool_flush_time = 30s
+          memory_pool_use_mmap = true
+
+          [r2dst]
+          type = s3
+          provider = Cloudflare
+          access_key_id = ${R2DST_ACCESS_KEY}
+          secret_access_key = ${R2DST_SECRET_KEY}
+          endpoint = ${R2DST_ENDPOINT}
+          force_path_style = true
+          acl = private
+          chunk_size = ${CHUNK_SIZE}
+          upload_cutoff = ${CUTOFF_SIZE}
+          no_check_bucket = true
+          memory_pool_flush_time = 30s
+          memory_pool_use_mmap = true
+          EOF
+
+          echo "✅ rclone.conf 已生成"
+        env:
+          R2PUSH_ACCESS_KEY: ${{ secrets.R2PUSH_ACCESS_KEY }}
+          R2PUSH_SECRET_KEY: ${{ secrets.R2PUSH_SECRET_KEY }}
+          R2PUSH_ENDPOINT: ${{ secrets.R2PUSH_ENDPOINT }}
+          R2DST_ACCESS_KEY: ${{ secrets.R2DST_ACCESS_KEY }}
+          R2DST_SECRET_KEY: ${{ secrets.R2DST_SECRET_KEY }}
+          R2DST_ENDPOINT: ${{ secrets.R2DST_ENDPOINT }}
+          CHUNK_SIZE: ${{ inputs.CHUNK_SIZE }}
+          CUTOFF_SIZE: ${{ inputs.CUTOFF_SIZE }}
+
+      - name: Create optimized migration script
+        run: |
+          set -e
+          cat > /tmp/migrate.sh <<'EOF'
+          #!/bin/bash
+          set -e
+
+          # 高性能迁移参数
+          COMMON_ARGS="--progress --log-level INFO --stats=60s --stats-one-line \
+          --transfers=${TRANSFERS} --checkers=${CHECKERS} \
+          --s3-upload-cutoff=${CUTOFF_SIZE} --s3-chunk-size=${CHUNK_SIZE} \
+          --checksum --size-only --no-check-dest \
+          --retries=10 --retries-sleep=30s --low-level-retries=20 \
+          --timeout=300s --contimeout=120s \
+          --buffer-size=512M --use-mmap \
+          --multi-thread-streams=4 --multi-thread-cutoff=64M \
+          --fast-list --no-traverse --no-update-modtime \
+          --s3-disable-checksum --disable-http2 \
+          --drive-chunk-size=256M --s3-memory-pool-flush-time=30s"
+
+          # 创建断点续传目录
+          mkdir -p /tmp/rclone-resume
+          COMMON_ARGS="$COMMON_ARGS --cache-dir=/tmp/rclone-resume --resume"
+
+          echo "开始迁移 - 参数: $COMMON_ARGS"
+          echo "当前时间: $(date)"
+          echo "系统信息: $(uname -a)"
+          echo "内存信息: $(free -h)"
+
+          MAX_RETRIES=10
+          ATTEMPT=1
+          RC=1
+          LAST_ERROR=""
+
+          while [ $ATTEMPT -le $MAX_RETRIES ] && [ $RC -ne 0 ]; do
+            echo "=== 尝试第 $ATTEMPT/$MAX_RETRIES 次迁移 ==="
+            echo "开始时间: $(date)"
+            
+            # 清空系统缓存以获取准确性能数据
+            sync && echo 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null
+            
+            if [[ "${MODE}" == "sync" ]]; then
+              timeout 86400 rclone sync r2src:"${SRC_BUCKET}" r2dst:"${DST_BUCKET}" $COMMON_ARGS --delete-after 2>&1 | tee /tmp/migration-log-${ATTEMPT}.txt
+            else
+              timeout 86400 rclone copy r2src:"${SRC_BUCKET}" r2dst:"${DST_BUCKET}" $COMMON_ARGS 2>&1 | tee /tmp/migration-log-${ATTEMPT}.txt
+            fi
+            
+            RC=${PIPESTATUS[0]}
+            
+            if [ $RC -eq 0 ]; then
+              echo "✅ 迁移成功完成"
+              break
+            elif [ $RC -eq 124 ]; then
+              echo "⏸️  24小时运行超时，继续断点续传..."
+              LAST_ERROR="TIMEOUT"
+            else
+              echo "❌ 迁移失败 (代码: $RC)，等待重试..."
+              LAST_ERROR=$(tail -20 /tmp/migration-log-${ATTEMPT}.txt | tr '\n' ' ')
+              sleep 60
+            fi
+            
+            # 保存当前进度信息
+            rclone about r2dst:"${DST_BUCKET}" --json > /tmp/progress-${ATTEMPT}.json 2>/dev/null || true
+            
+            ATTEMPT=$((ATTEMPT + 1))
+          done
+
+          if [ $RC -ne 0 ]; then
+            echo "❌ 所有重试尝试均失败"
+            echo "最后错误: $LAST_ERROR"
+            exit $RC
+          fi
+          EOF
+
+          chmod +x /tmp/migrate.sh
+
+      - name: Run optimized migration
+        run: |
+          set -e
+          echo "== 执行优化迁移 =="
+          echo "并发设置: ${TRANSFERS}传输/${CHECKERS}校验"
+          echo "分块设置: ${CUTOFF_SIZE}/${CHUNK_SIZE}"
+          
+          # 监控系统性能
+          (while true; do
+            echo "=== 系统监控 $(date) ==="
+            free -h
+            echo "IO状态:"
+            iostat -dx 1 1 || true
+            echo "网络状态:"
+            iftop -t -s 10 2>/dev/null || true
+            sleep 300
+          done) &
+          MONITOR_PID=$!
+          
+          # 执行迁移
+          /tmp/migrate.sh || MIGRATION_RC=$?
+          
+          # 停止监控
+          kill $MONITOR_PID 2>/dev/null || true
+          
+          if [ -n "$MIGRATION_RC" ] && [ "$MIGRATION_RC" -ne 0 ]; then
+            exit $MIGRATION_RC
+          fi
+
+      - name: Save migration state
+        if: always()
+        run: |
+          set -e
+          echo "== 保存迁移状态 =="
+          
+          # 保存当前进度
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          mkdir -p /tmp/migration-state
+          
+          # 复制日志和配置文件
+          cp ~/.config/rclone/rclone.conf /tmp/migration-state/rclone.conf.$TIMESTAMP
+          cp /tmp/migrate.sh /tmp/migration-state/migrate.sh.$TIMESTAMP
+          cp /tmp/migration-log-*.txt /tmp/migration-state/ 2>/dev/null || true
+          cp /tmp/progress-*.json /tmp/migration-state/ 2>/dev/null || true
+          
+          # 上传状态到目标桶的特定目录
+          rclone copy /tmp/migration-state/ r2dst:"${DST_BUCKET}-migration-state/$TIMESTAMP/" --quiet || true
+          
+          echo "状态已保存到: ${DST_BUCKET}-migration-state/$TIMESTAMP/"
+
+      - name: Generate performance report
+        if: always()
+        run: |
+          {
+            echo "### R2迁移性能报告"
+            echo "- **状态**: $(if [ ${{ job.status }} == 'success' ]; then echo '完成 ✅'; else echo '失败 ❌'; fi)"
+            echo "- **模式**: \`${MODE}\`"
+            echo "- **源桶**: \`${SRC_BUCKET}\`"
+            echo "- **目标桶**: \`${DST_BUCKET}\`"
+            echo "- **并发**: ${TRANSFERS}传输/${CHECKERS}校验"
+            echo "- **分块**: ${CUTOFF_SIZE}/${CHUNK_SIZE}"
+            echo ""
+            echo "#### 迁移统计"
+            echo "\`\`\`"
+            echo "源桶大小:"
+            rclone size r2src:"${SRC_BUCKET}" --json 2>/dev/null | jq || echo "无法获取统计"
+            echo ""
+            echo "目标桶大小:"
+            rclone size r2dst:"${DST_BUCKET}" --json 2>/dev/null | jq || echo "无法获取统计"
+            echo "\`\`\`"
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload logs artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: migration-logs
+          path: |
+            /tmp/migration-log-*.txt
+            /tmp/progress-*.json
+          retention-days: 7
