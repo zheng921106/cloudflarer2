@@ -7,10 +7,12 @@ on:
         description: "A桶名称（来源）"
         required: true
         default: "yasyadong001"
+        type: string
       DST_BUCKET:
         description: "B桶名称（目标）"
         required: true
         default: "yas009"
+        type: string
       MODE:
         description: "迁移模式"
         required: true
@@ -21,28 +23,33 @@ on:
         description: "并发传输数"
         required: true
         default: "64"
+        type: string
       CHECKERS:
         description: "并发校验数"
         required: true
         default: "128"
+        type: string
       CHUNK_SIZE:
         description: "S3分块大小 (建议: 128M~512M)"
         required: true
         default: "256M"
+        type: string
       SHARDS:
         description: "计划分片数（越大越安全，单片更短）"
         required: true
         default: "200"
+        type: string
       MAX_PARALLEL:
         description: "矩阵最大并发（防止超配或被限速）"
         required: true
         default: "8"
+        type: string
 
 jobs:
   plan:
     name: Build object list & shard plan
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 180   # ↑ 提高到3小时，避免大桶列举时超时
     outputs:
       matrix: ${{ steps.make-matrix.outputs.matrix }}
       shard_count: ${{ steps.make-matrix.outputs.count }}
@@ -51,6 +58,12 @@ jobs:
       SHARDS: ${{ inputs.SHARDS }}
       CHUNK_SIZE: ${{ inputs.CHUNK_SIZE }}
     steps:
+      - name: Mask secrets
+        run: |
+          echo "::add-mask::${{ secrets.R2PUSH_ACCESS_KEY }}"
+          echo "::add-mask::${{ secrets.R2PUSH_SECRET_KEY }}"
+          echo "::add-mask::${{ secrets.R2PUSH_ENDPOINT }}"
+
       - name: Install rclone & jq
         run: |
           set -e
@@ -69,10 +82,8 @@ jobs:
           access_key_id = ${R2PUSH_ACCESS_KEY}
           secret_access_key = ${R2PUSH_SECRET_KEY}
           endpoint = ${R2PUSH_ENDPOINT}
+          region = auto
           force_path_style = true
-          acl = private
-          chunk_size = ${CHUNK_SIZE}
-          upload_cutoff = ${CHUNK_SIZE}
           no_check_bucket = true
           EOF
         env:
@@ -84,28 +95,39 @@ jobs:
         run: |
           set -e
           mkdir -p /tmp/plan
-          # 仅列出文件（不含“目录”占位），递归输出相对路径
-          # 若对象极多，这一步是一次性成本；失败可重试
-          rclone lsf r2src:"${SRC_BUCKET}" -R --files-only > /tmp/plan/all_keys.txt
-          wc -l /tmp/plan/all_keys.txt || true
+          # 断点友好：若上次中断，这里直接复用已生成的清单
+          if [ -s /tmp/plan/all_keys.txt ]; then
+            echo "Reuse existing /tmp/plan/all_keys.txt"
+          else
+            # 仅列出文件（不含“目录”占位），递归输出相对路径
+            # --fast-list 对大量对象更高效
+            rclone lsf r2src:"${SRC_BUCKET}" -R --files-only --fast-list > /tmp/plan/all_keys.txt
+          fi
+          echo "Total objects: $(wc -l < /tmp/plan/all_keys.txt)"
 
       - name: Split into shards
         id: split
         run: |
           set -e
           mkdir -p /tmp/plan/keylists
-          # 均分为 ${SHARDS} 份；如对象很少，也会产生较少的片
+          # 按行均匀切分；对象很少时会产生更少分片
           split -n l/${SHARDS} -d -a 4 /tmp/plan/all_keys.txt /tmp/plan/keylists/chunk_
-          ls -l /tmp/plan/keylists | wc -l
+          COUNT=$(ls -1 /tmp/plan/keylists/chunk_* 2>/dev/null | wc -l || echo 0)
+          echo "count=$COUNT" >> $GITHUB_OUTPUT
+          echo "Shard files: $COUNT"
 
       - name: Build dynamic matrix JSON
         id: make-matrix
         run: |
           set -e
           cd /tmp/plan/keylists
-          files=($(ls -1 chunk_* | sort))
+          files=($(ls -1 chunk_* 2>/dev/null | sort || true))
           count=${#files[@]}
-          # 生成形如：{"chunk":["chunk_0000","chunk_0001",...]}
+          if [ "$count" -eq 0 ]; then
+            echo 'matrix={"chunk":[]}' >> $GITHUB_OUTPUT
+            echo "count=0" >> $GITHUB_OUTPUT
+            exit 0
+          fi
           jq -n --argjson arr "$(printf '%s\n' "${files[@]}" | jq -R . | jq -s .)" '{chunk:$arr}' > /tmp/matrix.json
           echo "matrix=$(cat /tmp/matrix.json)" >> $GITHUB_OUTPUT
           echo "count=$count" >> $GITHUB_OUTPUT
@@ -116,7 +138,7 @@ jobs:
         with:
           name: r2-keylists
           path: /tmp/plan/keylists
-          retention-days: 7
+          retention-days: 14
 
       - name: Summary
         run: |
@@ -129,8 +151,9 @@ jobs:
   migrate:
     name: Migrate shard (${{ matrix.chunk }})
     needs: [plan]
+    if: ${{ fromJson(needs.plan.outputs.matrix).chunk && fromJson(needs.plan.outputs.matrix).chunk.length > 0 }}
     runs-on: ubuntu-latest
-    timeout-minutes: 360   # 每片<6小时；整体并行控制在 MAX_PARALLEL
+    timeout-minutes: 350   # < 6小时，避免被系统强杀
     strategy:
       fail-fast: false
       max-parallel: ${{ inputs.MAX_PARALLEL }}
@@ -143,6 +166,15 @@ jobs:
       CHECKERS: ${{ inputs.CHECKERS }}
       CHUNK_SIZE: ${{ inputs.CHUNK_SIZE }}
     steps:
+      - name: Mask secrets
+        run: |
+          echo "::add-mask::${{ secrets.R2PUSH_ACCESS_KEY }}"
+          echo "::add-mask::${{ secrets.R2PUSH_SECRET_KEY }}"
+          echo "::add-mask::${{ secrets.R2PUSH_ENDPOINT }}"
+          echo "::add-mask::${{ secrets.R2DST_ACCESS_KEY }}"
+          echo "::add-mask::${{ secrets.R2DST_SECRET_KEY }}"
+          echo "::add-mask::${{ secrets.R2DST_ENDPOINT }}"
+
       - name: Install rclone & jq
         run: |
           set -e
@@ -161,10 +193,8 @@ jobs:
           access_key_id = ${R2PUSH_ACCESS_KEY}
           secret_access_key = ${R2PUSH_SECRET_KEY}
           endpoint = ${R2PUSH_ENDPOINT}
+          region = auto
           force_path_style = true
-          acl = private
-          chunk_size = ${CHUNK_SIZE}
-          upload_cutoff = ${CHUNK_SIZE}
           no_check_bucket = true
 
           [r2dst]
@@ -173,10 +203,8 @@ jobs:
           access_key_id = ${R2DST_ACCESS_KEY}
           secret_access_key = ${R2DST_SECRET_KEY}
           endpoint = ${R2DST_ENDPOINT}
+          region = auto
           force_path_style = true
-          acl = private
-          chunk_size = ${CHUNK_SIZE}
-          upload_cutoff = ${CHUNK_SIZE}
           no_check_bucket = true
           EOF
         env:
@@ -201,31 +229,28 @@ jobs:
           set -euo pipefail
           SHARD_FILE="$1"
 
+          # 断点续传要点：
+          # 1) --files-from 只复制本分片中的对象（天然可重试）
+          # 2) --ignore-existing 避免重复覆盖已到位对象（幂等）
+          # 3) 合理的重试与超时
           COMMON_ARGS="--progress --log-level INFO --stats=60s --stats-one-line \
           --transfers=${TRANSFERS} --checkers=${CHECKERS} \
           --s3-upload-cutoff=${CHUNK_SIZE} --s3-chunk-size=${CHUNK_SIZE} \
-          --retries=10 --retries-sleep=30s --low-level-retries=20 \
+          --retries=10 --retries-sleep=30s --low-level-retries=30 \
           --timeout=300s --contimeout=120s \
           --buffer-size=512M --use-mmap \
           --multi-thread-streams=8 --multi-thread-cutoff=64M \
-          --fast-list --no-traverse --s3-disable-checksum \
-          --ignore-existing"   # 断点续传友好：已存在的对象直接跳过
+          --fast-list --s3-no-check-bucket \
+          --ignore-existing"
 
           echo "== 开始迁移分片: $(basename "$SHARD_FILE") =="
-          echo "时间: $(date)"
-          echo "系统: $(uname -a)"
-          echo "并发: transfers=${TRANSFERS}, checkers=${CHECKERS}, chunk=${CHUNK_SIZE}"
-
-          # 使用 --files-from 精准迁移本分片对象集合
           LOG="/tmp/${MODE}-$(basename "$SHARD_FILE").log"
 
+          # 分片层级不要直接 sync（会误删分片外对象），统一使用 copy。
           if [[ "${MODE}" == "sync" ]]; then
-            # sync 语义在分片层面会把“分片外”的对象忽略删除，所以不能直接 sync。
-            # 因此对 sync 模式：执行 copy 分片迁移 + 统一 verify 后，再单独提供一个“清理多余对象”的可选 job（见下文 clean-extra）。
-            echo "[提示] sync 在分片级不安全，本步骤按 copy 执行，后续通过 clean-extra 统一清理多余对象。"
+            echo "[提示] MODE=sync 但在分片内先执行 copy；最终清理多余对象由 clean-extra 统一完成。"
           fi
 
-          # 实施 copy
           set +e
           rclone copy r2src:"${SRC_BUCKET}" r2dst:"${DST_BUCKET}" \
             ${COMMON_ARGS} --files-from "$SHARD_FILE" 2>&1 | tee "$LOG"
@@ -249,15 +274,15 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: logs-${{ matrix.chunk }}
-          path: |
-            /tmp/*.log
-          retention-days: 7
+          path: /tmp/*.log
+          retention-days: 14
 
   verify:
     name: Final verify & report
     needs: [plan, migrate]
+    if: ${{ always() }}
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
     env:
       SRC_BUCKET: ${{ inputs.SRC_BUCKET }}
       DST_BUCKET: ${{ inputs.DST_BUCKET }}
@@ -281,10 +306,8 @@ jobs:
           access_key_id = ${R2PUSH_ACCESS_KEY}
           secret_access_key = ${R2PUSH_SECRET_KEY}
           endpoint = ${R2PUSH_ENDPOINT}
+          region = auto
           force_path_style = true
-          acl = private
-          chunk_size = ${CHUNK_SIZE}
-          upload_cutoff = ${CHUNK_SIZE}
           no_check_bucket = true
 
           [r2dst]
@@ -293,10 +316,8 @@ jobs:
           access_key_id = ${R2DST_ACCESS_KEY}
           secret_access_key = ${R2DST_SECRET_KEY}
           endpoint = ${R2DST_ENDPOINT}
+          region = auto
           force_path_style = true
-          acl = private
-          chunk_size = ${CHUNK_SIZE}
-          upload_cutoff = ${CHUNK_SIZE}
           no_check_bucket = true
           EOF
         env:
@@ -323,15 +344,16 @@ jobs:
       - name: Full bucket check (size-only)
         run: |
           set -e
-          # S3/R2 多段上传导致 ETag/MD5 不可靠，采用 --size-only 快速校验
-          # 如需更强校验，可在后续使用 rclone md5sum 仅对小文件抽样
-          rclone check r2src:"${SRC_BUCKET}" r2dst:"${DST_BUCKET}" --size-only --one-way --fast-list --checkers 256 --log-file /tmp/check.log --log-level INFO || true
+          # R2 多段上传导致 ETag/MD5 不稳定，采用 size-only 快速校验
+          rclone check r2src:"${SRC_BUCKET}" r2dst:"${DST_BUCKET}" \
+            --size-only --one-way --fast-list --checkers 256 \
+            --log-file /tmp/check.log --log-level INFO || true
 
       - name: Random spot-check (20 files)
         run: |
           set -e
           tmp=$(mktemp)
-          rclone lsf r2src:"${SRC_BUCKET}" -R --files-only | shuf -n 20 > "$tmp"
+          rclone lsf r2src:"${SRC_BUCKET}" -R --files-only --fast-list | shuf -n 20 > "$tmp"
           echo "随机抽查以下文件："
           cat "$tmp"
           echo ""
@@ -350,13 +372,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: verify-logs
-          path: |
-            /tmp/check.log
-          retention-days: 7
+          path: /tmp/check.log
+          retention-days: 14
 
-  # （可选）若你一定要“同步”语义（删除目标多余对象），单独运行此 Job：
-  # 1) 先完成所有 migrate 分片 + verify
-  # 2) 再触发 clean-extra，它会在目标侧删除源中不存在的对象
+  # （可选）如需“镜像”语义（删除目标多余对象），在完成所有 migrate + verify 后启用此 Job。
   clean-extra:
     if: ${{ github.event.inputs.MODE == 'sync' }}
     name: Clean extras on destination (sync after copy)
@@ -366,7 +385,6 @@ jobs:
     env:
       SRC_BUCKET: ${{ inputs.SRC_BUCKET }}
       DST_BUCKET: ${{ inputs.DST_BUCKET }}
-      CHUNK_SIZE: ${{ inputs.CHUNK_SIZE }}
     steps:
       - name: Install rclone
         run: |
@@ -382,6 +400,7 @@ jobs:
           access_key_id = ${R2PUSH_ACCESS_KEY}
           secret_access_key = ${R2PUSH_SECRET_KEY}
           endpoint = ${R2PUSH_ENDPOINT}
+          region = auto
           force_path_style = true
           no_check_bucket = true
 
@@ -391,6 +410,7 @@ jobs:
           access_key_id = ${R2DST_ACCESS_KEY}
           secret_access_key = ${R2DST_SECRET_KEY}
           endpoint = ${R2DST_ENDPOINT}
+          region = auto
           force_path_style = true
           no_check_bucket = true
           EOF
@@ -401,6 +421,7 @@ jobs:
           R2DST_ACCESS_KEY: ${{ secrets.R2DST_ACCESS_KEY }}
           R2DST_SECRET_KEY: ${{ secrets.R2DST_SECRET_KEY }}
           R2DST_ENDPOINT: ${{ secrets.R2DST_ENDPOINT }}
+
       - name: Prune extra objects (one-way sync delete)
         run: |
           # 注意：此步会删除 r2dst 中、但不在 r2src 的对象
