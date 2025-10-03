@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     permissions:
-      actions: write   # 允许触发下一波
+      actions: write
     env:
       SRC_BUCKET:   ${{ inputs.SRC_BUCKET }}
       DST_BUCKET:   ${{ inputs.DST_BUCKET }}
@@ -184,6 +184,7 @@ jobs:
           name: logs-pass-${{ inputs.PASS_INDEX }}
           path: /tmp/*.log
           retention-days: 7
+
       - name: Compute next pass index
         id: calc
         run: |
@@ -198,7 +199,8 @@ jobs:
             echo "has_next=false" >> "$GITHUB_OUTPUT"
             echo "next_index=$NEXT" >> "$GITHUB_OUTPUT"
           fi
-            - name: Trigger next PASS（自动接力）
+
+      - name: Trigger next PASS（自动接力）
         if: ${{ steps.calc.outputs.has_next == 'true' }}
         uses: actions/github-script@v7
         env:
@@ -219,7 +221,7 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               workflow_id: context.workflow,
-              ref: context.ref.replace('refs/heads/',''), // 或者直接用 context.ref_name
+              ref: context.ref.replace('refs/heads/',''),
               inputs: {
                 SRC_BUCKET:   process.env.SRC_BUCKET,
                 DST_BUCKET:   process.env.DST_BUCKET,
@@ -235,10 +237,9 @@ jobs:
             });
             core.notice(`已触发下一波 PASS=${next}/${process.env.PASS_COUNT}`);
 
-
   # 可选：总迁移完成后手动跑一次（或另开workflow）做真正镜像删除
   final_sync:
-    if: ${{ false }}   # 需要时改为 true 或单独开工作流
+    if: ${{ false }}
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
@@ -249,6 +250,7 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y jq
           rclone version
+
       - name: Prepare rclone.conf
         run: |
           mkdir -p ~/.config/rclone
@@ -305,4 +307,3 @@ jobs:
           name: final-sync-logs
           path: /tmp/*.log
           retention-days: 7
-(Line: 202, Col: 13): Unexpected symbol: '+'. Located at position 30 within expression: (fromJSON(inputs.PASS_INDEX) + 1) < fromJSON(inputs.PASS_COUNT)
