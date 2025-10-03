@@ -184,7 +184,7 @@ jobs:
           name: logs-pass-${{ inputs.PASS_INDEX }}
           path: /tmp/*.log
           retention-days: 7
-      - name: Compute next pass index
+            - name: Compute next pass index
         id: calc
         run: |
           set -euo pipefail
@@ -198,12 +198,13 @@ jobs:
             echo "has_next=false" >> "$GITHUB_OUTPUT"
             echo "next_index=$NEXT" >> "$GITHUB_OUTPUT"
           fi
+
       - name: Trigger next PASS（自动接力）
-        if: ${{ (fromJSON(inputs.PASS_INDEX) + 1) < fromJSON(inputs.PASS_COUNT) }}
+        if: ${{ steps.calc.outputs.has_next == 'true' }}
         uses: actions/github-script@v7
         with:
           script: |
-            const next = (parseInt(core.getInput('PASS_INDEX')) + 1).toString();
+            const next = core.getInput('next_index', { required: false }) || process.env.NEXT_INDEX || '${{ steps.calc.outputs.next_index }}';
             await github.rest.actions.createWorkflowDispatch({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -223,6 +224,7 @@ jobs:
               }
             });
             core.notice(`已触发下一波 PASS=${next}/${process.env.PASS_COUNT}`);
+
 
   # 可选：总迁移完成后手动跑一次（或另开workflow）做真正镜像删除
   final_sync:
